@@ -107,12 +107,28 @@ def rs_ranks(rets):
     return {s: (100.0 * i / (n - 1) if n > 1 else 50.0) for i, s in enumerate(order)}
 
 
-def statement_lagging(latest_q_end, last_reported):
-    """True if the company reported a result ~a full quarter after our latest statement's
-    quarter-end, i.e. the data we hold is a quarter behind (the KARURVYSYA case)."""
-    if latest_q_end is None or last_reported is None:
+def year_ago(series, qdates):
+    """Value for the quarter ~1 year before the latest one, matched BY DATE.
+    Yahoo sometimes skips a quarter, so 'the 5th column' is not always a year ago (VIJAYA case)."""
+    if not series or not qdates:
         return None
-    return last_reported >= latest_q_end + timedelta(days=92)
+    for v, d in zip(series, qdates):
+        if abs((qdates[0] - d).days - 365) <= 20:
+            return v
+    return None
+
+
+def statement_lagging(latest_q_end, last_reported, next_earnings=None):
+    """True if the data we hold is a quarter behind: the company reported ~a quarter after our
+    latest statement's quarter-end, or its NEXT result date is already two quarters out
+    (the KARURVYSYA / COFORGE case)."""
+    if latest_q_end is None:
+        return None
+    if last_reported is not None and last_reported >= latest_q_end + timedelta(days=92):
+        return True
+    if next_earnings is not None and next_earnings >= latest_q_end + timedelta(days=183):
+        return True
+    return False
 
 
 def is_bank(sector, industry):
@@ -125,12 +141,21 @@ def evaluate(px, fund, rs_rank, rs_gap, rules, today):
     eps_q = fund.get("eps_q") or []
     rev_q = fund.get("rev_q") or []
     ni_q = fund.get("ni_q") or []
-    eps_g = yoy(eps_q[0], eps_q[4]) if len(eps_q) >= 5 else None
-    sales_g = yoy(rev_q[0], rev_q[4]) if len(rev_q) >= 5 else None
-    ni_g = yoy(ni_q[0], ni_q[4]) if len(ni_q) >= 5 else None
+    qd = fund.get("qdates") or []
+    eps_g = yoy(eps_q[0], year_ago(eps_q, qd)) if eps_q else None
+    sales_g = yoy(rev_q[0], year_ago(rev_q, qd)) if rev_q else None
+    ni_g = yoy(ni_q[0], year_ago(ni_q, qd)) if ni_q else None
+    lagging = statement_lagging(qd[0] if qd else None, fund.get("last_reported"), fund.get("next_earnings"))
+    if lagging and fund.get("vendor_rev_g") is not None and fund.get("vendor_ni_g") is not None:
+        # statement is a quarter behind: Yahoo's own growth fields already show the newer quarter
+        eps_g, sales_g, ni_g = fund["vendor_ni_g"], fund["vendor_rev_g"], fund["vendor_ni_g"]
+        flags.append("C-FROM-VENDOR(statement a quarter behind)")
     ea = fund.get("eps_a") or []
     cg = cagr(ea[0], ea[3], 3) if len(ea) >= 4 else None
     roe = fund.get("roe")
+    if roe is None and fund.get("roe_calc") is not None:
+        roe = fund["roe_calc"]
+        flags.append("ROE-CALC(Yahoo had none)")
 
     C = eps_g is not None and sales_g is not None and eps_g >= rules["eps_q_yoy"] and sales_g >= rules["sales_q_yoy"]
     A = cg is not None and roe is not None and cg >= rules["eps_3y_cagr"] and roe >= rules["roe"]
@@ -141,15 +166,14 @@ def evaluate(px, fund, rs_rank, rs_gap, rules, today):
     I = inst is not None and inst >= rules["inst"]
 
     if eps_g is None or sales_g is None:
-        flags.append("NA-GROWTH(<5 qtrs or base<=0)")
+        flags.append("NA-GROWTH(no year-ago quarter or base<=0)")
     if eps_g is not None and sales_g is not None and sales_g > 0 and eps_g > 2.5 * sales_g:
         flags.append("PROFIT>2.5xSALES")
     if eps_g is not None and eps_g > 1.0:
         flags.append("BASE-CHECK(>100%)")
     if px["big_down"]:
         flags.append("BIG-DOWN-DAY")
-    qd = fund.get("qdates") or []
-    if statement_lagging(qd[0] if qd else None, fund.get("last_reported")):
+    if lagging:
         flags.append("STALE(newer result out)")
     ne = fund.get("next_earnings")
     if ne is not None and 0 <= (ne - today).days <= 14:

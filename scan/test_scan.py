@@ -80,6 +80,16 @@ class Rules(unittest.TestCase):
         self.assertTrue(logic.statement_lagging(date(2026, 6, 30), date(2026, 10, 17)))
         self.assertFalse(logic.statement_lagging(date(2026, 6, 30), date(2026, 8, 5)))
 
+    def test_year_ago_matched_by_date_not_position(self):
+        # Yahoo skipped Sep-2025: the 5th column is Mar-2025, NOT a year before Jun-2026 (the VIJAYA bug)
+        qd = [date(2026, 6, 30), date(2026, 3, 31), date(2025, 12, 31), date(2025, 6, 30), date(2025, 3, 31)]
+        self.assertEqual(logic.year_ago([5.15, 4.65, 4.19, 3.75, 3.38], qd), 3.75)
+        self.assertIsNone(logic.year_ago([5.15, 4.65], qd[:2]))
+
+    def test_stale_via_next_earnings(self):
+        self.assertTrue(logic.statement_lagging(date(2026, 6, 30), date(2026, 7, 27), date(2027, 1, 21)))
+        self.assertFalse(logic.statement_lagging(date(2026, 6, 30), date(2026, 8, 5), date(2026, 11, 10)))
+
     def test_pct_of_high_uses_closes_and_dates(self):
         s = series(300, 100, 0.004)
         s["closes"][-10] = 1000.0
@@ -103,12 +113,18 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(r["core_clean"])
         self.assertEqual((r["C"], r["A"], r["N"], r["L"]), ("Y", "Y", "Y", "Y"))
 
-    def test_stale_and_mismatch_flags_block_clean(self):
-        bad = dict(GOOD_FUND, last_reported=date(2026, 10, 17), vendor_rev_g=0.05)
+    def test_stale_flag_blocks_clean(self):
+        bad = dict(GOOD_FUND, last_reported=date(2026, 10, 17))
         r = self.run_scan({"GOOD.NS": bad})["rows"][0]
         self.assertTrue(r["core"])
         self.assertFalse(r["core_clean"])
         self.assertIn("STALE", r["flags"])
+
+    def test_mismatch_flag_blocks_clean(self):
+        bad = dict(GOOD_FUND, vendor_rev_g=0.05)
+        r = self.run_scan({"GOOD.NS": bad})["rows"][0]
+        self.assertTrue(r["core"])
+        self.assertFalse(r["core_clean"])
         self.assertIn("CHECK-SALES", r["flags"])
 
     def test_negative_base_gives_na_not_percent(self):
@@ -117,6 +133,27 @@ class EndToEnd(unittest.TestCase):
         self.assertIsNone(r["eps_q_yoy"])
         self.assertEqual(r["C"], "n")
         self.assertIn("NA-GROWTH", r["flags"])
+
+    def test_gap_quarter_uses_date_match(self):
+        gap = dict(GOOD_FUND, eps_q=[5.15, 4.65, 4.19, 3.75, 3.38], rev_q=[2310, 2194, 2052, 1881, 1732],
+                   ni_q=[531, 479, 432, 386, 349],
+                   qdates=[date(2026, 6, 30), date(2026, 3, 31), date(2025, 12, 31), date(2025, 6, 30), date(2025, 3, 31)])
+        r = self.run_scan({"GOOD.NS": gap})["rows"][0]
+        self.assertAlmostEqual(r["sales_q_yoy"], 0.228, places=2)
+        self.assertAlmostEqual(r["eps_q_yoy"], 0.373, places=2)
+
+    def test_stale_statement_uses_vendor_growth(self):
+        stale = dict(GOOD_FUND, next_earnings=date(2027, 1, 21), vendor_rev_g=0.17, vendor_ni_g=0.37)
+        r = self.run_scan({"GOOD.NS": stale})["rows"][0]
+        self.assertEqual(r["sales_q_yoy"], 0.17)
+        self.assertIn("C-FROM-VENDOR", r["flags"])
+        self.assertFalse(r["core_clean"])
+
+    def test_roe_fallback(self):
+        f = dict(GOOD_FUND, roe=None, roe_calc=0.19)
+        r = self.run_scan({"GOOD.NS": f})["rows"][0]
+        self.assertEqual(r["A"], "Y")
+        self.assertIn("ROE-CALC", r["flags"])
 
     def test_bank_flagged(self):
         bank = dict(GOOD_FUND, industry="Banks - Regional")

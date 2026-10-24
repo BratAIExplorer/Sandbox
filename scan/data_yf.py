@@ -94,6 +94,15 @@ class YFSource:
         rev_q, _ = _row(q, ["Total Revenue", "Operating Revenue"])
         ni_q, _ = _row(q, ["Net Income", "Net Income Common Stockholders"])
         eps_a, _ = _row(t.income_stmt, ["Diluted EPS", "Basic EPS"])
+        roe_calc = None
+        try:  # Yahoo's returnOnEquity is often empty for Indian stocks: net income / average equity, same fiscal year
+            ni_a, ni_d = _row(t.income_stmt, ["Net Income", "Net Income Common Stockholders"])
+            eq_a, eq_d = _row(t.balance_sheet, ["Stockholders Equity", "Common Stock Equity"])
+            if ni_a and eq_a and ni_d[0] == eq_d[0] and ni_a[0] is not None and eq_a[0]:
+                eqs = [x for x in eq_a[:2] if x]
+                roe_calc = ni_a[0] / (sum(eqs) / len(eqs))
+        except Exception:
+            pass
         last_rep = next_e = None
         try:
             ed = t.get_earnings_dates(limit=12)
@@ -109,7 +118,7 @@ class YFSource:
             sector=info.get("sector"), industry=info.get("industry"),
             mcap=_num(info.get("marketCap")), pe=_num(info.get("trailingPE")),
             pb=_num(info.get("priceToBook")), inst=_num(info.get("heldPercentInstitutions")),
-            roe=_num(info.get("returnOnEquity")),
+            roe=_num(info.get("returnOnEquity")), roe_calc=roe_calc,
             eps_q=eps_q, rev_q=rev_q, ni_q=ni_q, qdates=qdates, eps_a=eps_a,
             vendor_rev_g=_num(info.get("revenueGrowth")),
             vendor_ni_g=_num(info.get("earningsQuarterlyGrowth")),
