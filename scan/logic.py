@@ -118,6 +118,17 @@ def year_ago(series, qdates):
     return None
 
 
+def growth(series, qdates):
+    """(growth, status). status: 'ok', 'missing' (no year-ago quarter in the data) or 'badbase' (base <= 0)."""
+    if not series:
+        return None, "missing"
+    prior = year_ago(series, qdates)
+    if prior is None:
+        return None, "missing"
+    g = yoy(series[0], prior)
+    return g, ("ok" if g is not None else "badbase")
+
+
 def statement_lagging(latest_q_end, last_reported, next_earnings=None):
     """True if the data we hold is a quarter behind: the company reported ~a quarter after our
     latest statement's quarter-end, or its NEXT result date is already two quarters out
@@ -131,6 +142,20 @@ def statement_lagging(latest_q_end, last_reported, next_earnings=None):
     return False
 
 
+def size_bucket(mcap_usd, price_usd):
+    """large >= $10B, mid $2-10B, small $300M-2B; penny = under $300M or share price under $1.
+    My own cut-offs (editable here), same in every market, converted to USD."""
+    if mcap_usd is None or price_usd is None:
+        return "unknown"
+    if price_usd < 1 or mcap_usd < 300e6:
+        return "penny"
+    if mcap_usd < 2e9:
+        return "small"
+    if mcap_usd < 10e9:
+        return "mid"
+    return "large"
+
+
 def is_bank(sector, industry):
     return "bank" in (industry or "").lower()
 
@@ -142,9 +167,19 @@ def evaluate(px, fund, rs_rank, rs_gap, rules, today):
     rev_q = fund.get("rev_q") or []
     ni_q = fund.get("ni_q") or []
     qd = fund.get("qdates") or []
-    eps_g = yoy(eps_q[0], year_ago(eps_q, qd)) if eps_q else None
-    sales_g = yoy(rev_q[0], year_ago(rev_q, qd)) if rev_q else None
-    ni_g = yoy(ni_q[0], year_ago(ni_q, qd)) if ni_q else None
+    eps_g, eps_st = growth(eps_q, qd)
+    sales_g, sales_st = growth(rev_q, qd)
+    ni_g, _ = growth(ni_q, qd)
+    sh_q = fund.get("shares_q") or []
+    sh_g = yoy(sh_q[0], year_ago(sh_q, qd)) if sh_q and year_ago(sh_q, qd) else None
+    # Yahoo's statements are sparse for some markets (Japan: 2 quarters, no revenue row): use Yahoo's own
+    # growth fields only when the statement has no year-ago quarter. A negative base stays n/a, never faked.
+    if sales_st == "missing" and fund.get("vendor_rev_g") is not None:
+        sales_g = fund["vendor_rev_g"]
+        flags.append("SALES-FROM-VENDOR(no statement data)")
+    if eps_st == "missing" and fund.get("vendor_ni_g") is not None:
+        eps_g = fund["vendor_ni_g"]
+        flags.append("EPS-FROM-VENDOR(no statement data)")
     lagging = statement_lagging(qd[0] if qd else None, fund.get("last_reported"), fund.get("next_earnings"))
     if lagging and fund.get("vendor_rev_g") is not None and fund.get("vendor_ni_g") is not None:
         # statement is a quarter behind: Yahoo's own growth fields already show the newer quarter
@@ -161,7 +196,7 @@ def evaluate(px, fund, rs_rank, rs_gap, rules, today):
     A = cg is not None and roe is not None and cg >= rules["eps_3y_cagr"] and roe >= rules["roe"]
     N = px["pct_high"] >= 1 - rules["near_high"]
     S = px["updown"] is not None and px["updown"] >= rules["updown"]
-    L = rs_gap >= rules["rs_gap"]
+    L = rs_gap is not None and rs_gap >= rules["rs_gap"]
     inst = fund.get("inst")
     I = inst is not None and inst >= rules["inst"]
 
@@ -171,6 +206,8 @@ def evaluate(px, fund, rs_rank, rs_gap, rules, today):
         flags.append("PROFIT>2.5xSALES")
     if eps_g is not None and eps_g > 1.0:
         flags.append("BASE-CHECK(>100%)")
+    if sh_g is not None and sh_g > 0.05:
+        flags.append(f"DILUTION(shares {sh_g:+.0%} YoY; a split/bonus can fake this)")
     if px["big_down"]:
         flags.append("BIG-DOWN-DAY")
     if lagging:
@@ -189,12 +226,12 @@ def evaluate(px, fund, rs_rank, rs_gap, rules, today):
 
     tests = dict(C=C, A=A, N=N, S=S, L=L, I=I)
     core = C and A
-    bad = [f for f in flags if f.startswith(("STALE", "CHECK", "NA-"))]
+    bad = [f for f in flags if f.startswith(("STALE", "CHECK", "NA-", "C-FROM", "SALES-FROM", "EPS-FROM"))]
     return dict(
         core=core, core_clean=core and not bad, tests=sum(tests.values()),
         **{k: ("Y" if v else "n") for k, v in tests.items()},
         eps_q_yoy=eps_g, sales_q_yoy=sales_g, eps_3y_cagr=cg, roe=roe, pe=pe, pb=fund.get("pb"),
-        rs_rank=round(rs_rank), rs_gap_pts=round(rs_gap * 100, 1),
+        rs_rank=round(rs_rank), rs_gap=rs_gap, shares_yoy=sh_g,
         latest_q=qd[0].isoformat() if qd else "", next_earnings=ne.isoformat() if ne else "",
         flags="; ".join(flags),
     )

@@ -25,7 +25,7 @@ GOOD_FUND = dict(
     name="Good Co", sector="Healthcare", industry="Diagnostics", mcap=50e9, pe=40, pb=5, inst=0.4, roe=0.20,
     eps_q=[12, 11, 10, 9, 8], rev_q=[130, 125, 120, 115, 100], ni_q=[12, 11, 10, 9, 8],
     qdates=[date(2026, 6, 30), date(2026, 3, 31), date(2025, 12, 31), date(2025, 9, 30), date(2025, 6, 30)],
-    eps_a=[40, 33, 27, 20], vendor_rev_g=0.30, vendor_ni_g=0.50,
+    eps_a=[40, 33, 27, 20], shares_q=[100, 100, 100, 100, 100], vendor_rev_g=0.30, vendor_ni_g=0.50,
     last_reported=date(2026, 8, 5), next_earnings=date(2026, 11, 10),
 )
 
@@ -39,6 +39,7 @@ class FakeSource:
             "FLAT.NS": series(300, 100, 0.0),                    # flat -> not up 12m
             "THIN.NS": series(300, 100, 0.004, vol=10),          # illiquid
             "SHORT.NS": series(100, 100, 0.004),                 # <1y history
+            "INR=X": series(300, 85, 0.0),
         }
 
     def prices(self, tickers):
@@ -100,7 +101,7 @@ class Rules(unittest.TestCase):
 
 class EndToEnd(unittest.TestCase):
     def run_scan(self, funds, **kw):
-        uni = [("GOOD.NS", "Good"), ("FLAT.NS", "Flat"), ("THIN.NS", "Thin"), ("SHORT.NS", "Short")]
+        uni = [(t, n, "INR") for t, n in (("GOOD.NS", "Good"), ("FLAT.NS", "Flat"), ("THIN.NS", "Thin"), ("SHORT.NS", "Short"))]
         return run_scan.run("india", FakeSource(funds), uni, TODAY, min_liq=1000, log=lambda *a: None, **kw)
 
     def test_funnel_and_core(self):
@@ -154,6 +155,67 @@ class EndToEnd(unittest.TestCase):
         r = self.run_scan({"GOOD.NS": f})["rows"][0]
         self.assertEqual(r["A"], "Y")
         self.assertIn("ROE-CALC", r["flags"])
+
+    def test_buckets(self):
+        self.assertEqual(logic.size_bucket(50e9, 100), "large")
+        self.assertEqual(logic.size_bucket(5e9, 10), "mid")
+        self.assertEqual(logic.size_bucket(1e9, 10), "small")
+        self.assertEqual(logic.size_bucket(100e6, 10), "penny")
+        self.assertEqual(logic.size_bucket(5e9, 0.5), "penny")
+        self.assertEqual(logic.size_bucket(None, 5), "unknown")
+
+    def test_bucket_filter_and_penny_flag(self):
+        tiny = dict(GOOD_FUND, mcap=2e9)     # 2e9 INR = ~$23M -> penny
+        r = self.run_scan({"GOOD.NS": tiny})["rows"][0]
+        self.assertEqual(r["bucket"], "penny")
+        self.assertIn("PENNY", r["flags"])
+        self.assertEqual(self.run_scan({"GOOD.NS": tiny}, buckets={"large"})["rows"], [])
+
+    def test_missing_fx_skips_stock(self):
+        uni = [("GOOD.NS", "Good", "ZZZ")]
+        res = run_scan.run("india", FakeSource({"GOOD.NS": GOOD_FUND}), uni, TODAY, log=lambda *a: None)
+        self.assertEqual(res["rows"], [])
+
+    def test_dilution_flag_and_shares_yoy(self):
+        f = dict(GOOD_FUND, shares_q=[112, 108, 105, 103, 100])
+        r = self.run_scan({"GOOD.NS": f})["rows"][0]
+        self.assertAlmostEqual(r["shares_yoy"], 0.12, places=2)
+        self.assertIn("DILUTION", r["flags"])
+
+    def test_sparse_statement_falls_back_to_vendor_for_missing_only(self):
+        # Japan-style: 2 quarters, no revenue row. Revenue falls back to Yahoo's field; flagged, never 'clean'.
+        jp = dict(GOOD_FUND, rev_q=[], qdates=[date(2026, 6, 30), date(2025, 6, 30)], eps_q=[144.5, 83.2],
+                  ni_q=[], shares_q=[1.40e9, 1.45e9], vendor_rev_g=0.189, vendor_ni_g=0.675)
+        r = self.run_scan({"GOOD.NS": jp})["rows"][0]
+        self.assertEqual(r["sales_q_yoy"], 0.189)
+        self.assertAlmostEqual(r["eps_q_yoy"], 144.5 / 83.2 - 1, places=3)
+        self.assertIn("SALES-FROM-VENDOR", r["flags"])
+        self.assertFalse(r["core_clean"])
+
+    def test_negative_base_is_not_rescued_by_vendor(self):
+        neg = dict(GOOD_FUND, eps_q=[5, 4, 3, 2, -1],
+                   qdates=[date(2026, 6, 30), date(2026, 3, 31), date(2025, 12, 31), date(2025, 9, 30), date(2025, 6, 30)],
+                   vendor_ni_g=2.5)
+        r = self.run_scan({"GOOD.NS": neg})["rows"][0]
+        self.assertIsNone(r["eps_q_yoy"])
+
+    def test_csv_has_all_requested_columns(self):
+        import csv, os, tempfile
+        res = self.run_scan({"GOOD.NS": GOOD_FUND})
+        old = os.getcwd(); os.chdir(tempfile.mkdtemp())
+        try:
+            run_scan.save(res, "india", TODAY)
+            with open(f"scan_india_{TODAY}.csv", newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+        finally:
+            os.chdir(old)
+        want = ["Mkt cap", "Price", "P/E", "Latest qtr", "EPS qtr YoY", "Sales qtr YoY", "EPS 3y CAGR", "ROE",
+                "Close vs 52w-high close", "High date", "RS gap", "RS rank", "Up/down vol", "Shares YoY"]
+        for col in want:
+            self.assertIn(col, rows[0], col)
+        self.assertTrue(rows[0]["EPS qtr YoY"].endswith("%"))
+        self.assertNotEqual(rows[0]["Shares YoY"], "")
+        self.assertNotEqual(rows[0]["High date"], "")
 
     def test_bank_flagged(self):
         bank = dict(GOOD_FUND, industry="Banks - Regional")

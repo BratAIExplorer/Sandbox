@@ -73,7 +73,9 @@ class YFSource:
     def fundamentals(self, sym):
         f = self.cache / f"{sym.replace('^', '_')}.json"
         if f.exists() and time.time() - f.stat().st_mtime < 86400:
-            return _revive(json.loads(f.read_text()))
+            cached = json.loads(f.read_text())
+            if "shares_q" in cached:        # older cache files lack newer fields: refetch
+                return _revive(cached)
         for attempt in range(3):
             try:
                 d = self._fetch(sym)
@@ -93,6 +95,7 @@ class YFSource:
         eps_q, qdates = _row(q, ["Diluted EPS", "Basic EPS"])
         rev_q, _ = _row(q, ["Total Revenue", "Operating Revenue"])
         ni_q, _ = _row(q, ["Net Income", "Net Income Common Stockholders"])
+        shares_q, _ = _row(q, ["Diluted Average Shares", "Basic Average Shares"])
         eps_a, _ = _row(t.income_stmt, ["Diluted EPS", "Basic EPS"])
         roe_calc = None
         try:  # Yahoo's returnOnEquity is often empty for Indian stocks: net income / average equity, same fiscal year
@@ -116,10 +119,10 @@ class YFSource:
         return dict(
             name=info.get("shortName") or info.get("longName") or sym,
             sector=info.get("sector"), industry=info.get("industry"),
-            mcap=_num(info.get("marketCap")), pe=_num(info.get("trailingPE")),
+            mcap=_num(info.get("marketCap")), shares_out=_num(info.get("sharesOutstanding")), pe=_num(info.get("trailingPE")),
             pb=_num(info.get("priceToBook")), inst=_num(info.get("heldPercentInstitutions")),
             roe=_num(info.get("returnOnEquity")), roe_calc=roe_calc,
-            eps_q=eps_q, rev_q=rev_q, ni_q=ni_q, qdates=qdates, eps_a=eps_a,
+            eps_q=eps_q, rev_q=rev_q, ni_q=ni_q, shares_q=shares_q, qdates=qdates, eps_a=eps_a,
             vendor_rev_g=_num(info.get("revenueGrowth")),
             vendor_ni_g=_num(info.get("earningsQuarterlyGrowth")),
             last_reported=last_rep, next_earnings=next_e,
